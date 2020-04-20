@@ -1,6 +1,7 @@
 package com.github.longshorej.tubihangout.service.impl
 
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 import akka.NotUsed
 import akka.actor.ActorSystem
@@ -35,13 +36,17 @@ object InMemoryAppService {
 class InMemoryAppService()(implicit system: ActorSystem) extends AppService {
   import InMemoryAppService._
 
+  // @TODO too low level, use an actor or something..
+  private val latestState = new AtomicReference(AppState.Empty)
+
   private val commandSink = MergeHub
     .source[CommandWithPromise[_]]
-    .fold(AppState.Empty) {
+    .fold(latestState.get) {
       case (state, container) =>
         val (newState, result, events) = handle(state, container.command)
 
         container.result.success(result)
+        latestState.set(newState)
 
         Source(events).runWith(hangoutEventSink)
 
@@ -66,8 +71,19 @@ class InMemoryAppService()(implicit system: ActorSystem) extends AppService {
     commandWithPromise.result.future
   }
 
-  def subscribe(hangoutId: UUID): Source[HangoutEvent, NotUsed] =
-    hangoutEventSource.filter(_.hangoutId == hangoutId)
+  def subscribe(hangoutId: UUID): Source[HangoutEvent, NotUsed] = {
+    val state = latestState.get
+
+    val derived = Option(state)
+      .flatMap(_.hangouts.get(hangoutId))
+      .flatMap(_.video)
+      .map(v => HangoutEvent.VideoPositionUpdated(hangoutId, v.id, v.position, v.paused))
+
+    val streamed =
+      hangoutEventSource.filter(_.hangoutId == hangoutId)
+
+    Source(derived.toList) ++ streamed
+  }
 
   private def handle[A](state: AppState, command: Command[A]): (AppState, A, List[HangoutEvent]) =
     command match {
@@ -97,7 +113,20 @@ class InMemoryAppService()(implicit system: ActorSystem) extends AppService {
             )
 
           case None =>
-            (state, (), Nil)
+            // @TODO this is automatic registration of hangouts, may want to reevaluate
+            //       it's useful for when the server restarts and there's clients out
+            //       there with active hangouts
+
+            (
+              state.copy(
+                hangouts = state.hangouts.updated(
+                  hangoutId,
+                  Hangout(hangoutId, "TODO", Some(HangoutVideo(id, paused, position)))
+                )
+              ),
+              (),
+              List(HangoutEvent.VideoPositionUpdated(hangoutId, id, position, paused))
+            )
         }
     }
 }
